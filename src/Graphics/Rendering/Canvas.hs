@@ -2,13 +2,12 @@
 
 module Graphics.Rendering.Canvas
   ( Render(..)
-  , renderWith
-  , withJSSurface
-  , withHTMLSurface
+  , doRender
+
   , newPath
   , moveTo
-  , lineTo
-  , curveTo
+  , relLineTo
+  , relCurveTo
   , arc
   , closePath
   , stroke
@@ -24,53 +23,52 @@ module Graphics.Rendering.Canvas
   , lineWidth
   , lineCap
   , lineJoin
+  , globalAlpha
   , withStyle
   ) where
 
-import Diagrams.Attributes(Color(..),LineCap(..),LineJoin(..))
-import Diagrams.TwoD(R2(..))
-import Control.Monad.State
-import Control.Applicative((<$>))
-import Data.List(intersperse)
-import Data.DList(DList,toList,fromList,append)
-import Data.Word(Word8)
-import Data.Monoid
-import Data.NumInstances
-import System.IO (openFile, hPutStr, IOMode(..), hClose)
+import           Control.Applicative((<$>))
+import           Control.Arrow ((***))
+import           Control.Monad.State
+import           Data.NumInstances ()
+import           Data.Word(Word8)
+import           Diagrams.Attributes(Color(..),LineCap(..),LineJoin(..))
+import qualified Graphics.Blank as C
 
 type RGBA = (Double, Double, Double, Double)
 
 data DrawState = DS
-                 { dsPos :: R2
+                 { dsPos :: (Float,Float)
                  , dsFill :: RGBA
                  , dsStroke :: RGBA
                  , dsCap :: LineCap
                  , dsJoin :: LineJoin
-                 , dsWidth :: Double
-                 , dsTransform :: [Double]
+                 , dsWidth :: Float
+                 , dsAlpha :: Float
+                 , dsTransform :: (Float,Float,Float,Float,Float,Float)
                  } deriving (Eq)
 
 emptyDS :: DrawState
-emptyDS = DS 0 (0,0,0,1) 0 LineCapButt LineJoinMiter 0 []
+emptyDS = DS 0 (0,0,0,1) 0 LineCapButt LineJoinMiter 0 1 (1,0,0,1,0,0)
 
 data RenderState = RS
                    { drawState :: DrawState
                    , saved :: [DrawState]
-                   , result :: DList String
                    }
 
 emptyRS :: RenderState
-emptyRS = RS emptyDS [] mempty
+emptyRS = RS emptyDS []
 
-newtype Render m = Render { runRender :: StateT RenderState IO m }
+newtype Render m = Render { runRender :: StateT RenderState C.Canvas m }
   deriving (Functor, Monad, MonadState RenderState)
 
-data Surface = Surface { header :: String, footer :: String, width :: Int, height :: Int, fileName :: String }
+doRender :: Render a -> C.Canvas a
+doRender r = evalStateT (runRender r) emptyRS
 
-write :: DList String -> Render ()
-write s = modify $ \rs@(RS{..}) -> rs { result = result `append` s }
+canvas :: C.Canvas a -> Render a
+canvas = Render . lift
 
-move :: R2 -> Render ()
+move :: (Float,Float) -> Render ()
 move p = modify $ \rs@(RS{..}) -> rs { drawState = drawState { dsPos = p } }
 
 setDS :: DrawState -> Render ()
@@ -79,90 +77,81 @@ setDS d = modify $ (\rs -> rs { drawState = d })
 saveRS :: Render ()
 saveRS = modify $ \rs@(RS{..}) -> rs { saved = drawState : saved }
 
+restoreRS :: Render ()
 restoreRS = modify go
   where
-    go rs@(RS{saved = d:ds, ..}) = rs { drawState = d, saved = ds }
+    go rs@(RS{saved = d:ds}) = rs { drawState = d, saved = ds }
     go rs = rs
 
-at :: Render R2
+at :: Render (Float,Float)
 at = (dsPos . drawState) <$> get
 
-renderWith :: MonadIO m => Surface -> Render a -> m a
-renderWith s r = liftIO $ do
-  (v,rs) <- runStateT (runRender r) emptyRS
-  h <- openFile (fileName s) WriteMode
-  hPutStr h (header s)
-  mapM_ (hPutStr h) (toList (result rs))
-  hPutStr h (footer s)
-  hClose h
-  return v
-
-withJSSurface :: String -> Int -> Int -> (Surface -> IO a) -> IO a
-withJSSurface file w h f = f s
-  where s = Surface jsHeader jsFooter w h file
-
-withHTMLSurface :: String -> Int -> Int -> (Surface -> IO a) -> IO a
-withHTMLSurface file w h f = f s
-  where s = Surface htmlHeader (htmlFooter w h) w h file
-
-renderJS :: String -> Render ()
-renderJS s = write $ fromList [jsPrefix, s, ";\n"]
-
-mkJSCall :: Show a => String -> [a] -> Render()
-mkJSCall n vs = renderJS . concat $ [n, "("] ++ intersperse "," (map show vs) ++ [")"]
-
 newPath :: Render ()
-newPath = renderJS "beginPath()"
+newPath = canvas $ C.beginPath ()
 
 closePath :: Render ()
-closePath = renderJS "closePath()"
+closePath = canvas $ C.closePath ()
 
 arc :: Double -> Double -> Double -> Double -> Double -> Render ()
-arc a b c d e = mkJSCall "arcTo" [a,b,c,d,e]
+arc a b c d e = canvas $ C.arc (realToFrac a, realToFrac b, realToFrac c, realToFrac d, realToFrac e,True)
 
 moveTo :: Double -> Double -> Render ()
 moveTo x y = do
-  mkJSCall "moveTo" [x,y]
-  move (x,y)
+  let x' = realToFrac x
+      y' = realToFrac y
+  canvas $ C.moveTo (x', y')
+  move (x', y')
 
-lineTo :: Double -> Double -> Render ()
-lineTo x y = do
+relLineTo :: Double -> Double -> Render ()
+relLineTo x y = do
   p <- at
-  let p'@(x',y') = p + (x,y)
-  mkJSCall "lineTo" [x',y']
+  let p' = p + (realToFrac x, realToFrac y)
+  canvas $ C.lineTo p'
   move p'
 
-curveTo :: Double -> Double -> Double -> Double -> Double -> Double -> Render ()
-curveTo ax ay bx by cx cy = do
---  lineTo cx cy
+relCurveTo :: Double -> Double -> Double -> Double -> Double -> Double -> Render ()
+relCurveTo ax ay bx by cx cy = do
   p <- at
-  let ps = map (p +) [(ax,ay),(bx,by),(cx,cy)]
-  mkJSCall "bezierCurveTo" (concatMap (\(a,b) -> [a,b]) ps)
-  move (last ps)
+  let [(ax',ay'),(bx',by'),(cx',cy')] = map ((p +) . (realToFrac *** realToFrac))
+                                          [(ax,ay),(bx,by),(cx,cy)]
+  canvas $ C.bezierCurveTo (ax',ay',bx',by',cx',cy')
+  move (cx',cy')
 
 stroke :: Render ()
-stroke = renderJS "stroke()"
+stroke = do
+
+  -- From the HTML5 canvas specification regarding line width:
+  --
+  --   "On setting, zero, negative, infinite, and NaN values must be
+  --   ignored, leaving the value unchanged; other values must change
+  --   the current value to the new value.
+  --
+  -- Hence we must implement a line width of zero by simply not
+  -- sending a stroke command.
+
+  w <- gets (dsWidth . drawState)
+  when (w > 0) (canvas $ C.stroke ())
 
 fill :: Render ()
-fill = renderJS "fill()"
+fill = canvas $ C.fill ()
 
 save :: Render ()
-save = saveRS >> renderJS "save()"
+save = saveRS >> canvas (C.save ())
 
 restore :: Render ()
-restore = restoreRS >> renderJS "restore()"
+restore = restoreRS >> canvas (C.restore ())
 
 byteRange :: Double -> Word8
 byteRange d = floor (d * 255)
 
 showColorJS :: (Color c) => c -> String
 showColorJS c = concat
-    [ "\"rgba("
+    [ "rgba("
     , s r, ","
     , s g, ","
     , s b, ","
     , show a
-    , ")\""
+    , ")"
     ]
   where s = show . byteRange
         (r,g,b,a) = colorToRGBA c
@@ -176,33 +165,34 @@ setDSWhen f r = do
 transform :: Double -> Double -> Double -> Double -> Double -> Double -> Render ()
 transform ax ay bx by tx ty = setDSWhen
                               (\ds -> ds { dsTransform = vs })
-                              (mkJSCall "transform" vs)
-    where vs = [ax,ay,bx,by,tx,ty]
+                              (canvas $ C.transform vs)
+    where vs = (realToFrac ax,realToFrac ay,realToFrac bx,realToFrac by,realToFrac tx,realToFrac ty)
 
 strokeColor :: (Color c) => c -> Render ()
 strokeColor c = setDSWhen
                 (\ds -> ds { dsStroke = colorToRGBA c})
-                (renderJS $ "strokeStyle = " ++ showColorJS c)
+                (canvas $ C.strokeStyle (showColorJS c))
 
 fillColor :: (Color c) => c -> Render ()
 fillColor c = setDSWhen
               (\ds -> ds { dsFill = colorToRGBA c })
-              (renderJS $ "fillStyle = " ++ showColorJS c)
+              (canvas $ C.fillStyle (showColorJS c))
 
 lineWidth :: Double -> Render ()
 lineWidth w = setDSWhen
-              (\ds -> ds { dsWidth = w })
-              (renderJS $ "lineWidth = " ++ show w)
+              (\ds -> ds { dsWidth = w' })
+              (canvas $ C.lineWidth w')
+  where w' = realToFrac w
 
 lineCap :: LineCap -> Render ()
 lineCap lc = setDSWhen
              (\ds -> ds { dsCap = lc })
-             (renderJS $ "lineCap = " ++ fromLineCap lc)
+             (canvas $ C.lineCap (fromLineCap lc))
 
 lineJoin :: LineJoin -> Render ()
 lineJoin lj = setDSWhen
               (\ds -> ds { dsJoin = lj })
-              (renderJS $ "lineJoin = " ++ fromLineJoin lj)
+              (canvas $ C.lineJoin (fromLineJoin lj))
 
 fromLineCap :: LineCap -> String
 fromLineCap LineCapRound  = show "round"
@@ -214,15 +204,21 @@ fromLineJoin LineJoinRound = show "round"
 fromLineJoin LineJoinBevel = show "bevel"
 fromLineJoin _             = show "miter"
 
+globalAlpha :: Double -> Render ()
+globalAlpha a = setDSWhen
+                (\ds -> ds { dsAlpha = a' })
+                (canvas $ C.globalAlpha a')
+  where a' = realToFrac a
+
 -- TODO: update the transform's state for translate, scale, and rotate
 translate :: Double -> Double -> Render ()
-translate x y = mkJSCall "translate" [x,y]
+translate x y = canvas $ C.translate (realToFrac x,realToFrac y)
 
 scale :: Double -> Double -> Render ()
-scale x y = mkJSCall "scale" [x,y]
+scale x y = canvas $ C.scale (realToFrac x,realToFrac y)
 
 rotate :: Double -> Render ()
-rotate t = mkJSCall "rotate" [t]
+rotate t = canvas $ C.rotate (realToFrac t)
 
 withStyle :: Render () -> Render () -> Render () -> Render ()
 withStyle t s r = do
@@ -231,35 +227,3 @@ withStyle t s r = do
   stroke
   fill
   restore
-
-jsHeader = "    function renderDiagram(c) {\n"
-        ++ jsPrefix ++ "fillStyle = \"rgba(0,0,0,0.0)\";\n"
-        ++ jsPrefix ++ "strokeStyle = \"rgba(0,0,0,1.0)\";\n"
-        ++ jsPrefix ++ "miterLimit = 10;\n"
-jsFooter = "    }\n"
-
-jsPrefix = "      c."
-
-htmlHeader = concat
-          [ "<!DOCTYPE HTML>\n\
-            \<html>\n\
-            \  <head>\n\
-            \  <script type=\"application/javascript\">\n\
-            \    function draw() {  \n\
-            \      var canvas = document.getElementById(\"canvas\");\n\
-            \      if (canvas.getContext) {\n\
-            \        var context = canvas.getContext(\"2d\");\n\
-            \        renderDiagram(context);\n\
-            \      }\n\
-            \    }\n\n"
-          , jsHeader
-          ]
-htmlFooter w h = concat
-          [ jsFooter
-          , " </script>\n\
-            \ </head>\n\
-            \ <body onload=\"draw();\">\n\
-            \   <canvas id=\"canvas\" width=\"", show w, "\" height=\"", show h, "\"></canvas>\n\
-            \ </body>\n\
-            \</html>"
-          ]
